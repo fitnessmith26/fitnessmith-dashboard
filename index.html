@@ -12,7 +12,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400;1,600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://alcdn.msftauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.27.0/dist/index.min.js"></script>
 <style>
 /* ============================================================
    FITNESSMITH DESIGN SYSTEM — TOKENS (from Claude Design export)
@@ -971,8 +971,9 @@ let msalInstance = null;
 let msalAccount  = null;
 
 async function initMsal() {
-  if (typeof msal === 'undefined') { console.warn('[MSAL] Library not loaded'); return; }
-  msalInstance = new msal.PublicClientApplication({
+  const msalLib = window.msal || window.msalBrowser;
+  if (!msalLib) { console.warn('[MSAL] Library not found on window'); return; }
+  msalInstance = new msalLib.PublicClientApplication({
     auth: {
       clientId:   MSAL_CLIENT_ID,
       authority:  `https://login.microsoftonline.com/${MSAL_TENANT_ID}`,

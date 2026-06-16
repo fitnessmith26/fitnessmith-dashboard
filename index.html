@@ -12,6 +12,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400;1,600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://alcdn.msftauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
 <style>
 /* ============================================================
    FITNESSMITH DESIGN SYSTEM — TOKENS (from Claude Design export)
@@ -956,6 +957,149 @@ table.data tr.total-row td:last-child{border-radius:0 0 var(--radius-md) 0}
 const N8N_BASE = 'https://fitnessmith.app.n8n.cloud/webhook';
 
 /* ============================================================
+   MICROSOFT LOGIN — MSAL + Graph API
+   Tenant ID and App ID from Fitnessmith Azure AD app registration.
+   ============================================================ */
+const MSAL_CLIENT_ID = '6fe9e7be-25e2-4799-bad3-aa52a74fc1ac';
+const MSAL_TENANT_ID = 'f1e6ac85-2bc2-478a-8df8-c93e4c68c677';
+const MSAL_REDIRECT_URI = window.location.hostname === 'dashboard.fitnessmith.com'
+  ? 'https://dashboard.fitnessmith.com'
+  : 'https://fitnessmith26.github.io/fitnessmith-dashboard';
+const GRAPH_SCOPES = ['User.Read', 'Mail.Read', 'Calendars.Read'];
+
+let msalInstance = null;
+let msalAccount  = null;
+
+async function initMsal() {
+  if (typeof msal === 'undefined') { console.warn('[MSAL] Library not loaded'); return; }
+  msalInstance = new msal.PublicClientApplication({
+    auth: {
+      clientId:   MSAL_CLIENT_ID,
+      authority:  `https://login.microsoftonline.com/${MSAL_TENANT_ID}`,
+      redirectUri: MSAL_REDIRECT_URI
+    },
+    cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false }
+  });
+  await msalInstance.initialize();
+  // Handle any redirect response (MSAL redirect flow)
+  const resp = await msalInstance.handleRedirectPromise().catch(e => { console.warn('[MSAL] Redirect:', e); return null; });
+  if (resp?.account) {
+    msalAccount = resp.account;
+    S.connections.outlook = true;
+    S.msalAccountId = msalAccount.homeAccountId;
+    saveState();
+  }
+  // Restore previous session from localStorage
+  if (!msalAccount && S.msalAccountId) {
+    const all = msalInstance.getAllAccounts();
+    msalAccount = all.find(a => a.homeAccountId === S.msalAccountId) || all[0] || null;
+    if (msalAccount) S.connections.outlook = true;
+  }
+}
+
+async function msalGetToken() {
+  if (!msalInstance || !msalAccount) return null;
+  try {
+    const r = await msalInstance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: msalAccount });
+    return r.accessToken;
+  } catch(e) {
+    try {
+      const r = await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES, account: msalAccount });
+      return r.accessToken;
+    } catch(e2) { console.warn('[MSAL] Token error:', e2); return null; }
+  }
+}
+
+async function msalLogin() {
+  if (!msalInstance) { toast('Microsoft login unavailable', 'warn', 'i-alert'); return false; }
+  try {
+    const r = await msalInstance.loginPopup({ scopes: GRAPH_SCOPES, prompt: 'select_account' });
+    msalAccount = r.account;
+    S.connections.outlook = true;
+    S.msalAccountId = msalAccount.homeAccountId;
+    saveState();
+    return true;
+  } catch(e) {
+    console.warn('[MSAL] Login error:', e);
+    if (e.errorCode !== 'user_cancelled') toast('Sign in failed — try again', 'warn', 'i-alert');
+    return false;
+  }
+}
+
+function msalLogout() {
+  if (msalInstance && msalAccount) {
+    msalInstance.logoutPopup({ account: msalAccount }).catch(()=>{});
+  }
+  msalAccount = null;
+  S.msalAccountId = null;
+  S.connections.outlook = false;
+  saveState();
+}
+
+async function fetchGraphEmails() {
+  const token = await msalGetToken();
+  if (!token) return null;
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const url = `https://graph.microsoft.com/v1.0/me/messages?$top=50&$orderby=receivedDateTime desc&$select=id,subject,from,receivedDateTime,isRead,importance,bodyPreview,flag&$filter=receivedDateTime ge ${since}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error('Graph emails ' + res.status);
+  const data = await res.json();
+  return (data.value || []).map(m => {
+    const from = m.from?.emailAddress;
+    const subj  = m.subject || '(no subject)';
+    const preview = m.bodyPreview || '';
+    const addr  = from?.address || '';
+    let cat = 'fyi';
+    if (/unsubscribe|newsletter|noreply|no-reply/i.test(addr)) cat = 'filtered';
+    else if (!m.isRead && /urgent|asap|immediately|action required/i.test(subj + ' ' + preview)) cat = 'needs-reply';
+    else if (/urgent|asap|immediately|action required/i.test(subj + ' ' + preview)) cat = 'time-sensitive';
+    return {
+      id:         m.id,
+      from:       from?.name || addr || 'Unknown',
+      addr,
+      subject:    subj,
+      preview,
+      time:       new Date(m.receivedDateTime),
+      unread:     !m.isRead,
+      flagged:    m.flag?.flagStatus === 'flagged',
+      cat,
+      importance: m.importance || 'normal'
+    };
+  });
+}
+
+async function fetchGraphCalendar() {
+  const token = await msalGetToken();
+  if (!token) return null;
+  const start = new Date(); start.setDate(start.getDate() - start.getDay()); start.setHours(0,0,0,0);
+  const end   = new Date(start); end.setDate(end.getDate() + 7);
+  const url = `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${start.toISOString()}&endDateTime=${end.toISOString()}&$select=id,subject,start,end,location,isOnlineMeeting,onlineMeetingUrl,attendees,bodyPreview&$orderby=start/dateTime&$top=50`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.timezone="UTC"' } });
+  if (!res.ok) throw new Error('Graph calendar ' + res.status);
+  const data = await res.json();
+  return (data.value || []).map(e => ({
+    t:         e.subject || '(no title)',
+    loc:       e.location?.displayName || '',
+    url:       e.onlineMeetingUrl || '',
+    start:     new Date((e.start?.dateTime || '') + (e.start?.timeZone === 'UTC' ? 'Z' : '')),
+    end:       new Date((e.end?.dateTime   || '') + (e.end?.timeZone   === 'UTC' ? 'Z' : '')),
+    attendees: (e.attendees || []).map(a => a.emailAddress?.name || a.emailAddress?.address || '')
+  }));
+}
+
+async function fetchGraphData() {
+  if (!msalAccount) return;
+  try {
+    const [emails, events] = await Promise.all([fetchGraphEmails(), fetchGraphCalendar()]);
+    if (emails?.length) { EMAILS.length = 0; EMAILS.push(...emails); }
+    if (events?.length) { EVENTS.length = 0; EVENTS.push(...events); }
+  } catch(e) {
+    console.warn('[Dashboard] Graph fetch failed:', e);
+    toast('Could not load Microsoft data', 'warn', 'i-alert');
+  }
+}
+
+/* ============================================================
    FITNESSMITH EXECUTIVE DASHBOARD — DATA LAYER
    All mock data is generated relative to "now" so the dashboard
    always reads live. Every dataset mirrors the shape the real
@@ -1246,6 +1390,7 @@ const _saved = loadState();
 const S = {
   connections: _saved.connections || { outlook:false, gcal:false, netsuite:false, claude:false },
   claudeKey: _saved.claudeKey || null,
+  msalAccountId: _saved.msalAccountId || null,
   onboarded: _saved.onboarded || false,
   tasks: _saved.tasks || null,           // null â†’ seed defaults on first run
   dismissedSuggestions: _saved.dismissedSuggestions || [],
@@ -1400,6 +1545,7 @@ function renderConnectCards(){
   $$("#connectCards [data-svc]").forEach(b=>b.onclick=()=>{
     const id = b.dataset.svc, svc = SERVICES.find(s=>s.id===id);
     if (b.dataset.act==="off") {
+      if (id==="outlook") { msalLogout(); renderConnectCards(); renderConnDots(); toast("Outlook disconnected","info"); return; }
       S.connections[id]=false;
       if (id==="claude") S.claudeKey=null;
       saveState(); renderConnectCards(); renderConnDots(); return;
@@ -1410,6 +1556,25 @@ function renderConnectCards(){
       S.claudeKey = k; S.connections.claude = true; saveState(); renderConnectCards(); renderConnDots();
       toast("Claude AI connected — AI Rewrite now uses real Claude","success","i-spark"); return;
     }
+    // Microsoft Outlook — real MSAL login
+    if (id==="outlook") {
+      b.innerHTML = `<span class="spinner"></span>Signing in…`; b.disabled = true;
+      msalLogin().then(success => {
+        if (success) {
+          renderConnectCards(); renderConnDots();
+          toast("Microsoft Outlook connected", "success", "i-check");
+          fetchGraphData().then(() => {
+            destroyCharts(); RENDER[currentPage]();
+            preHideAnimatables(currentPage);
+            requestAnimationFrame(() => animateCards(currentPage));
+          });
+        } else {
+          renderConnectCards();
+        }
+      });
+      return;
+    }
+    // Other services — placeholder
     b.innerHTML = `<span class="spinner"></span>Authorizing…`; b.disabled = true;
     setTimeout(()=>{
       S.connections[id]=true; saveState(); renderConnectCards(); renderConnDots();
@@ -2632,9 +2797,10 @@ async function fetchLiveData() {
     }
   };
 
+  // Skip n8n email/calendar if Microsoft login is active — Graph API handles those
   const [emailsData, calData, bookData, finData, installsData] = await Promise.all([
-    safe(`${N8N_BASE}/fitnessmith/emails`),
-    safe(`${N8N_BASE}/fitnessmith/calendar`),
+    msalAccount ? Promise.resolve(null) : safe(`${N8N_BASE}/fitnessmith/emails`),
+    msalAccount ? Promise.resolve(null) : safe(`${N8N_BASE}/fitnessmith/calendar`),
     safe(`${N8N_BASE}/fitnessmith/sales`),
     safe(`${N8N_BASE}/fitnessmith/financials`),
     safe(`${N8N_BASE}/fitnessmith/installs`),
@@ -2695,18 +2861,32 @@ renderNav(); renderConnDots(); renderNotifs();
 if (!S.onboarded) showConnectFlow(); else $("#connectOverlay").classList.add("hidden");
 navigate("briefing");
 
-// Fetch live data in background — re-render current page when ready
-fetchLiveData().then(() => {
-  destroyCharts();
-  RENDER[currentPage]();
-  preHideAnimatables(currentPage);
-  requestAnimationFrame(() => animateCards(currentPage));
-  lastRefreshed = new Date();
-  $("#tbRefreshed").textContent = fmtRefreshed(lastRefreshed);
-  toast("Live data loaded", "success", "i-refresh");
-}).catch(err => {
-  console.warn("[Dashboard] Live data load failed:", err);
-});
+// Boot sequence: init MSAL → fetch Microsoft data if signed in → fetch n8n data
+(async () => {
+  await initMsal();
+  renderConnDots(); // Update dots now that MSAL state is known
+
+  // If already signed in to Microsoft, fetch Graph data first
+  if (msalAccount) {
+    await fetchGraphData().catch(e => console.warn('[Dashboard] Graph boot fetch failed:', e));
+    destroyCharts(); RENDER[currentPage]();
+    preHideAnimatables(currentPage);
+    requestAnimationFrame(() => animateCards(currentPage));
+  }
+
+  // Fetch n8n data (NetSuite sections + email/calendar fallback if not signed in)
+  fetchLiveData().then(() => {
+    destroyCharts();
+    RENDER[currentPage]();
+    preHideAnimatables(currentPage);
+    requestAnimationFrame(() => animateCards(currentPage));
+    lastRefreshed = new Date();
+    $("#tbRefreshed").textContent = fmtRefreshed(lastRefreshed);
+    toast("Live data loaded", "success", "i-refresh");
+  }).catch(err => {
+    console.warn("[Dashboard] Live data load failed:", err);
+  });
+})();
 
 /* ============================================================ THEME TOGGLE */
 (function(){

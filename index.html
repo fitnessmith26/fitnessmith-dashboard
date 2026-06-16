@@ -1135,7 +1135,7 @@ function initGoogleAuth() {
         const prof = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: `Bearer ${googleAccessToken}` } });
         if (prof.ok) {
           const p = await prof.json();
-          if (!S.userName && p.name) {
+          if (p.name) {
             S.userName = p.name;
             S.userInitials = ((p.given_name?.[0]||'') + (p.family_name?.[0]||'')).toUpperCase();
           }
@@ -1536,6 +1536,11 @@ function updateUserDisplay(){
   if (avatar) { avatar.textContent = initials || ''; avatar.title = name || 'User'; }
 }
 const _saved = loadState();
+// One-time migration: clear hardcoded name from old sessions
+if (_saved.userName === 'Michael Scichilone' || _saved.userName === 'Michael') {
+  delete _saved.userName;
+  delete _saved.userInitials;
+}
 const S = {
   connections: _saved.connections || { outlook:false, gcal:false, netsuite:false, claude:false },
   claudeKey: _saved.claudeKey || null,
@@ -2114,7 +2119,18 @@ function dayConflicts(evts){
   return flags;
 }
 function renderCalendar(){
-  // Show connect prompt if no calendar source connected
+  // Case 1: gcal was connected but token expired (page refresh) and no Outlook
+  if (S.connections.gcal && !googleAccessToken && !S.connections.outlook) {
+    $("#page-calendar").innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:16px;padding:48px;text-align:center">
+        <svg class="icon" style="width:48px;height:48px;opacity:.3"><use href="#i-cal"/></svg>
+        <div style="font-size:var(--fs-h4);font-weight:var(--fw-bold);color:var(--text-primary)">Reconnect Google Calendar</div>
+        <p style="color:var(--text-muted);max-width:360px;line-height:var(--lh-relaxed)">Your Google session expired. Tap below to reconnect and see your real schedule.</p>
+        <button class="btn btn-primary" onclick="googleLogin()">${icon("i-link")} Reconnect Google Calendar</button>
+      </div>`;
+    return;
+  }
+  // Case 2: nothing connected at all
   if (!S.connections.outlook && !S.connections.gcal) {
     $("#page-calendar").innerHTML = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:16px;padding:48px;text-align:center">
@@ -2124,6 +2140,13 @@ function renderCalendar(){
         <button class="btn btn-primary" onclick="showConnectFlow()">${icon("i-link")} Connect Calendar</button>
       </div>`;
     return;
+  }
+  // Case 3: gcal active token OR outlook connected — filter out mock events
+  if (!S.connections.outlook || !googleAccessToken) {
+    // Only show real sourced events, not mock placeholders
+    const realEvents = EVENTS.filter(e => e.source === 'outlook' || e.source === 'google');
+    EVENTS.length = 0;
+    EVENTS.push(...realEvents);
   }
   const monday = new Date(weekMonday.getTime() + weekOffset*7*DAY);
   const days = [...Array(7)].map((_,i)=>new Date(monday.getTime()+i*DAY));

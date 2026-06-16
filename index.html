@@ -13,6 +13,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400;1,600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://alcdn.msauth.net/browser/2.32.0/js/msal-browser.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 /* ============================================================
    FITNESSMITH DESIGN SYSTEM — TOKENS (from Claude Design export)
@@ -1092,10 +1093,114 @@ async function fetchGraphData() {
   try {
     const [emails, events] = await Promise.all([fetchGraphEmails(), fetchGraphCalendar()]);
     if (emails?.length) { EMAILS.length = 0; EMAILS.push(...emails); }
-    if (events?.length) { EVENTS.length = 0; EVENTS.push(...events); }
+    if (events?.length) {
+      EVENTS.length = 0;
+      EVENTS.push(...events.map(e => ({...e, source:'outlook'})));
+      EVENTS.sort((a,b) => a.start - b.start);
+    }
   } catch(e) {
     console.warn('[Dashboard] Graph fetch failed:', e);
     toast('Could not load Microsoft data', 'warn', 'i-alert');
+  }
+}
+
+/* ============================================================
+   GOOGLE CALENDAR — OAuth via Google Identity Services
+   ============================================================ */
+const GOOGLE_CLIENT_ID = '232473651083-censs67eimhqu4sh2puct46hjr6babu8.apps.googleusercontent.com';
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
+let googleTokenClient = null;
+let googleAccessToken = null;
+
+function initGoogleAuth() {
+  if (!window.google?.accounts?.oauth2) { console.warn('[Google] GIS not loaded yet'); return; }
+  googleTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: GOOGLE_SCOPES,
+    callback: async (response) => {
+      if (response.error) {
+        console.warn('[Google] Auth error:', response.error);
+        toast('Google sign in failed', 'warn', 'i-alert');
+        renderConnectCards();
+        return;
+      }
+      googleAccessToken = response.access_token;
+      S.connections.gcal = true;
+      saveState();
+      renderConnectCards();
+      renderConnDots();
+      toast('Google Calendar connected', 'success', 'i-check');
+      await fetchGoogleCalendarData();
+      destroyCharts(); RENDER[currentPage]();
+      preHideAnimatables(currentPage);
+      requestAnimationFrame(() => animateCards(currentPage));
+    }
+  });
+}
+
+function googleLogin() {
+  // GIS loads async — init if not done yet
+  if (!googleTokenClient && window.google?.accounts?.oauth2) initGoogleAuth();
+  if (!googleTokenClient) {
+    // Wait up to 3s for GIS to load then retry
+    let tries = 0;
+    const wait = setInterval(() => {
+      if (window.google?.accounts?.oauth2) { initGoogleAuth(); }
+      if (googleTokenClient) { clearInterval(wait); googleTokenClient.requestAccessToken({ prompt: 'consent' }); return; }
+      if (++tries > 6) { clearInterval(wait); toast('Google login unavailable — refresh and try again', 'warn', 'i-alert'); renderConnectCards(); }
+    }, 500);
+    return;
+  }
+  googleTokenClient.requestAccessToken({ prompt: 'consent' });
+}
+
+function googleLogout() {
+  if (googleAccessToken && window.google?.accounts?.oauth2) {
+    google.accounts.oauth2.revoke(googleAccessToken, () => {});
+  }
+  googleAccessToken = null;
+  S.connections.gcal = false;
+  saveState();
+  // Remove Google events from EVENTS, keep Outlook ones
+  const filtered = EVENTS.filter(e => e.source !== 'google');
+  EVENTS.length = 0; EVENTS.push(...filtered);
+}
+
+async function fetchGoogleCalendar() {
+  if (!googleAccessToken) return null;
+  const start = new Date(); start.setDate(start.getDate() - start.getDay()); start.setHours(0,0,0,0);
+  const end = new Date(start); end.setDate(end.getDate() + 7);
+  const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(start.toISOString())}&timeMax=${encodeURIComponent(end.toISOString())}&singleEvents=true&orderBy=startTime&maxResults=50`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${googleAccessToken}` } });
+  if (!res.ok) {
+    if (res.status === 401) { googleAccessToken = null; S.connections.gcal = false; saveState(); }
+    throw new Error('Google Calendar ' + res.status);
+  }
+  const data = await res.json();
+  return (data.items || []).map(e => ({
+    t:         e.summary || '(no title)',
+    loc:       e.location || '',
+    url:       e.hangoutLink || '',
+    start:     new Date(e.start?.dateTime || e.start?.date),
+    end:       new Date(e.end?.dateTime   || e.end?.date),
+    attendees: (e.attendees || []).map(a => a.displayName || a.email || ''),
+    source:    'google'
+  }));
+}
+
+async function fetchGoogleCalendarData() {
+  try {
+    const events = await fetchGoogleCalendar();
+    if (events?.length) {
+      // Remove old Google events, keep Outlook, then merge and sort
+      const outlook = EVENTS.filter(e => e.source !== 'google');
+      EVENTS.length = 0;
+      EVENTS.push(...outlook, ...events);
+      EVENTS.sort((a,b) => a.start - b.start);
+    }
+  } catch(e) {
+    console.warn('[Google] Calendar fetch failed:', e);
+    toast('Could not load Google Calendar', 'warn', 'i-alert');
   }
 }
 
@@ -1546,6 +1651,7 @@ function renderConnectCards(){
     const id = b.dataset.svc, svc = SERVICES.find(s=>s.id===id);
     if (b.dataset.act==="off") {
       if (id==="outlook") { msalLogout(); renderConnectCards(); renderConnDots(); toast("Outlook disconnected","info"); return; }
+      if (id==="gcal") { googleLogout(); renderConnectCards(); renderConnDots(); toast("Google Calendar disconnected","info"); return; }
       S.connections[id]=false;
       if (id==="claude") S.claudeKey=null;
       saveState(); renderConnectCards(); renderConnDots(); return;
@@ -1572,6 +1678,13 @@ function renderConnectCards(){
           renderConnectCards();
         }
       });
+      return;
+    }
+    // Google Calendar — real OAuth
+    if (id==="gcal") {
+      b.innerHTML = `<span class="spinner"></span>Signing in…`; b.disabled = true;
+      googleLogin();
+      setTimeout(() => renderConnectCards(), 500); // re-enable button if popup closed
       return;
     }
     // Other services — placeholder
@@ -2864,6 +2977,9 @@ navigate("briefing");
 // Boot sequence: init MSAL → fetch Microsoft data if signed in → fetch n8n data
 (async () => {
   await initMsal();
+  // Init Google Auth after GIS script loads (it loads async)
+  if (window.google?.accounts?.oauth2) { initGoogleAuth(); }
+  else { window.addEventListener('load', () => { if (window.google?.accounts?.oauth2) initGoogleAuth(); }); }
   renderConnDots(); // Update dots now that MSAL state is known
 
   // If already signed in to Microsoft, fetch Graph data first

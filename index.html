@@ -1192,10 +1192,10 @@ async function fetchGoogleCalendarData() {
   try {
     const events = await fetchGoogleCalendar();
     if (events?.length) {
-      // Remove old Google events, keep Outlook, then merge and sort
-      const outlook = EVENTS.filter(e => e.source !== 'google');
+      // Keep only real Outlook events — discard mock data and old google events
+      const outlookEvents = EVENTS.filter(e => e.source === 'outlook');
       EVENTS.length = 0;
-      EVENTS.push(...outlook, ...events);
+      EVENTS.push(...outlookEvents, ...events);
       EVENTS.sort((a,b) => a.start - b.start);
     }
   } catch(e) {

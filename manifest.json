@@ -1,0 +1,24 @@
+{
+  "name": "Fitnessmith Executive Dashboard",
+  "short_name": "Fitnessmith",
+  "description": "Live executive dashboard for Fitnessmith leadership.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#141414",
+  "theme_color": "#141414",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "https://placehold.co/192x192/00b0f0/ffffff?text=FS",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://placehold.co/512x512/00b0f0/ffffff?text=FS",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
